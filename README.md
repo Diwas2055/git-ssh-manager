@@ -28,7 +28,7 @@ A comprehensive bash script that automatically manages multiple GitHub accounts 
 
 ```bash
 # Download the script
-curl -O https://raw.githubusercontent.com/your-repo/git-ssh-manager.sh
+curl -O https://raw.githubusercontent.com/Diwas2055/git-ssh-manager/main/git-ssh-manager.sh
 # Or save the script as 'git-ssh-manager.sh'
 
 # Make it executable
