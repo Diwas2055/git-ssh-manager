@@ -1,524 +1,586 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
 # =============================================================================
 # Git SSH Multi-Account Manager
 # =============================================================================
 # Description: Manages multiple GitHub accounts with SSH keys automatically
-# Version: 3.0
+# Version: 3.2
 # Author: Git SSH Manager Team
 # License: MIT
+# Requirements: Bash 4.4+, git, ssh, ssh-keygen
 # =============================================================================
 
-set -eo pipefail
+# -----------------------------------------------------------------------------
+# Strict Error Handling
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+shopt -s inherit_errexit 2>/dev/null || true
 
-# =============================================================================
-# COLORS AND FORMATTING
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Version Check (Bash 4.4+ for inherit_errexit)
+# -----------------------------------------------------------------------------
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    echo "Warning: Bash 4.4+ recommended for best compatibility" >&2
+fi
 
-readonly _RED='\033[0;31m'
-readonly _GREEN='\033[0;32m'
-readonly _YELLOW='\033[1;33m'
-readonly _BLUE='\033[0;34m'
-readonly _PURPLE='\033[0;35m'
-readonly _CYAN='\033[0;36m'
-readonly _NC='\033[0m'
-readonly _BOLD='\033[1m'
+# -----------------------------------------------------------------------------
+# Constants (readonly for safety)
+# -----------------------------------------------------------------------------
+readonly SCRIPT_NAME="${BASH_SOURCE[0]##*/}"
+readonly SCRIPT_VERSION="3.2"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
-# =============================================================================
-# DEFAULT CONFIGURATION
-# =============================================================================
+# File paths
+readonly SSH_DIR="${HOME}/.ssh"
+readonly CONFIG_FILE="${HOME}/.git-config-settings"
+readonly SSH_CONFIG="${SSH_DIR}/config"
+readonly WORK_SSH_KEY="${SSH_DIR}/id_ed25519_work"
+readonly PERSONAL_SSH_KEY="${SSH_DIR}/id_ed25519_personal"
 
-declare -gr WORK_FOLDER="${WORK_FOLDER:-$HOME/Desktop/Krispcall}"
-declare -g WORK_NAME="Your Work Name"
-declare -g WORK_EMAIL="your-work-email@company.com"
-declare -gr WORK_HOST="github-work"
+# SSH host aliases
+readonly WORK_HOST="github-work"
+readonly PERSONAL_HOST="github-personal"
+readonly DEFAULT_HOST="github.com"
 
-declare -g PERSONAL_NAME="Your Personal Name"
-declare -g PERSONAL_EMAIL="your-personal-email@gmail.com"
-declare -gr PERSONAL_HOST="github-personal"
+# Associative array for account types
+declare -Ar ACCOUNT_INFO=(
+    ["work"]="Work"
+    ["personal"]="Personal"
+)
 
-declare -gr WORK_SSH_KEY="$HOME/.ssh/id_ed25519_work"
-declare -gr PERSONAL_SSH_KEY="$HOME/.ssh/id_ed25519_personal"
-declare -gr CONFIG_FILE="$HOME/.git-config-settings"
-declare -gr SSH_CONFIG="$HOME/.ssh/config"
+# Default values (empty to force user configuration)
+WORK_FOLDER="${WORK_FOLDER:-}"
+WORK_NAME="${WORK_NAME:-}"
+WORK_EMAIL="${WORK_EMAIL:-}"
+PERSONAL_NAME="${PERSONAL_NAME:-}"
+PERSONAL_EMAIL="${PERSONAL_EMAIL:-}"
 
-declare -gr SCRIPT_NAME="$(basename "$0")"
-declare -gr VERSION="3.0"
+# -----------------------------------------------------------------------------
+# Logging & Output Functions
+# -----------------------------------------------------------------------------
+declare LOG_LEVEL="${LOG_LEVEL:-INFO}"
+declare TRACE_MODE="${TRACE_MODE:-false}"
 
-# =============================================================================
-# DEPENDENCY CHECKS
-# =============================================================================
+# Log levels: DEBUG, INFO, WARN, ERROR
+_log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
 
-check_dependencies() {
-    local missing_deps=()
+    local color
+    case "$level" in
+        DEBUG)   color="\033[0;34m" ;;
+        INFO)    color="\033[0;32m" ;;
+        WARN)    color="\033[1;33m" ;;
+        ERROR)   color="\033[0;31m" ;;
+        *)       color="\033[0m" ;;
+    esac
 
-    for cmd in git ssh ssh-keygen; do
-        if ! command -v "$cmd" &>/dev/null; then
-            missing_deps+=("$cmd")
-        fi
-    done
+    # Only output if level meets threshold
+    local level_num
+    case "$LOG_LEVEL" in
+        DEBUG)   level_num=0 ;;
+        INFO)    level_num=1 ;;
+        WARN)    level_num=2 ;;
+        ERROR)   level_num=3 ;;
+        *)       level_num=1 ;;
+    esac
 
-    if [[ ${#missing_deps[@]} -gt 0 ]]; then
-        echo -e "${_RED}Error: Missing required dependencies: ${missing_deps[*]}${_NC}" >&2
-        echo -e "${_YELLOW}Install them with your package manager:${_NC}"
-        echo "  macOS: brew install git openssh"
-        echo "  Ubuntu/Debian: sudo apt-get install git openssh-client"
-        echo "  Arch: sudo pacman -S git openssh"
-        exit 1
+    local current_level_num
+    case "$level" in
+        DEBUG)   current_level_num=0 ;;
+        INFO)    current_level_num=1 ;;
+        WARN)    current_level_num=2 ;;
+        ERROR)   current_level_num=3 ;;
+        *)       current_level_num=1 ;;
+    esac
+
+    (( current_level_num >= level_num )) || return 0
+
+    if [[ "$level" == "ERROR" ]]; then
+        printf '\033[0;31m✗\033[0m %s\n' "$message" >&2
+    else
+        printf '\033[0;32m✓\033[0m %s\n' "$message"
     fi
 }
 
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
+log_debug()   { _log DEBUG "$@"; }
+log_info()    { _log INFO "$@"; }
+log_warn()    { _log WARN "$@"; }
+log_error()   { _log ERROR "$@"; }
 
+# Formatted output functions
 print_banner() {
-    echo -e "${_CYAN}${_BOLD}"
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║         Git SSH Multi-Account Manager v${VERSION}              ║"
-    echo "║              Seamless GitHub Account Switching               ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${_NC}"
-    echo ""
-}
-
-print_success() {
-    echo -e "${_GREEN}✓${_NC} $*"
-}
-
-print_error() {
-    echo -e "${_RED}✗${_NC} $*" >&2
-}
-
-print_warning() {
-    echo -e "${_YELLOW}⚠${_NC} $*"
-}
-
-print_info() {
-    echo -e "${_BLUE}ℹ${_NC} $*"
+    printf '\033[0;36m\033[1m'
+    printf '╔══════════════════════════════════════════════════════════════╗\n'
+    printf '║         Git SSH Multi-Account Manager v%s              ║\n' "$SCRIPT_VERSION"
+    printf '║              Seamless GitHub Account Switching               ║\n'
+    printf '╚══════════════════════════════════════════════════════════════╝\n'
+    printf '\033[0m\n'
 }
 
 print_header() {
-    echo -e "\n${_CYAN}${_BOLD}━━━ $* ━━━${_NC}\n"
+    local title="$*"
+    printf '\n\033[0;36m\033[1m━━━ %s ━━━\033[0m\n\n' "$title"
 }
 
 print_section() {
-    echo -e "${_BOLD}$*${_NC}"
+    printf '\033[1m%s\033[0m\n' "$*"
 }
 
-is_git_repository() {
-    git rev-parse --git-dir &>/dev/null
+# -----------------------------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------------------------
+# Expand ~ to $HOME
+expand_path() {
+    local path="$1"
+    local result="${path/#\~/$HOME}"
+    printf '%s' "$result"
 }
 
+# Validate email format
 is_valid_email() {
     local email="$1"
     [[ "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]
 }
 
-expand_path() {
-    local path="$1"
-    echo "${path/#\~/$HOME}"
+# Check if running in git repository
+is_git_repository() {
+    git rev-parse --git-dir &>/dev/null
 }
 
+# Confirm yes/no with default
 confirm_yes_no() {
     local prompt="$1"
     local default="${2:-no}"
     local response
 
     if [[ "$default" == "yes" ]]; then
-        read -p "$(echo -e "${_YELLOW}${prompt} [Y/n]: ${_NC}")" response
+        read -rp "$(printf '\033[1;33m%s [Y/n]: \033[0m' "$prompt")" response
         [[ ! "$response" =~ ^[Nn]$ ]]
     else
-        read -p "$(echo -e "${_YELLOW}${prompt} [y/N]: ${_NC}")" response
+        read -rp "$(printf '\033[1;33m%s [y/N]: \033[0m' "$prompt")" response
         [[ "$response" =~ ^[Yy]$ ]]
     fi
 }
 
-confirm_continue() {
-    local prompt="$1"
-    confirm_yes_no "$prompt" "no"
-}
+confirm_continue() { confirm_yes_no "$1" "no"; }
 
-# =============================================================================
-# CONFIGURATION MANAGEMENT
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Configuration Management
+# -----------------------------------------------------------------------------
 load_configuration() {
     if [[ -f "$CONFIG_FILE" ]]; then
         # shellcheck source=/dev/null
-        source "$CONFIG_FILE"
+        if ! source "$CONFIG_FILE" 2>/dev/null; then
+            log_warn "Failed to load configuration file"
+            return 1
+        fi
         return 0
     fi
     return 1
 }
 
 save_configuration() {
-    local config_content
-    config_content="# Git SSH Configuration Settings"
-    config_content+="\n# Generated: $(date '+%Y-%m-%d %H:%M:%S')"
-    config_content+="\nWORK_FOLDER=\"$WORK_FOLDER\""
-    config_content+="\nWORK_NAME=\"$WORK_NAME\""
-    config_content+="\nWORK_EMAIL=\"$WORK_EMAIL\""
-    config_content+="\nPERSONAL_NAME=\"$PERSONAL_NAME\""
-    config_content+="\nPERSONAL_EMAIL=\"$PERSONAL_EMAIL\""
+    # Ensure config directory exists with proper permissions
+    local config_dir
+    config_dir="$(dirname -- "$CONFIG_FILE")"
+    mkdir -p -- "$config_dir"
+    chmod 700 -- "$config_dir"
 
-    echo -e "$config_content" > "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"
-    print_success "Configuration saved to $CONFIG_FILE"
+    # Write configuration using printf for safety
+    {
+        printf '# Git SSH Configuration Settings\n'
+        printf '# Generated: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        [[ -n "$WORK_FOLDER" ]] && printf 'WORK_FOLDER=%q\n' "$WORK_FOLDER"
+        [[ -n "$WORK_NAME" ]] && printf 'WORK_NAME=%q\n' "$WORK_NAME"
+        [[ -n "$WORK_EMAIL" ]] && printf 'WORK_EMAIL=%q\n' "$WORK_EMAIL"
+        [[ -n "$PERSONAL_NAME" ]] && printf 'PERSONAL_NAME=%q\n' "$PERSONAL_NAME"
+        [[ -n "$PERSONAL_EMAIL" ]] && printf 'PERSONAL_EMAIL=%q\n' "$PERSONAL_EMAIL"
+    } > "$CONFIG_FILE"
+
+    chmod 600 -- "$CONFIG_FILE"
+    log_info "Configuration saved to $CONFIG_FILE"
 }
 
-# ====================================================================
-# SSH KEY MANAGEMENT
-# =============================================================================
+# -----------------------------------------------------------------------------
+# SSH Key Management
+# -----------------------------------------------------------------------------
+# Check for required commands
+check_dependencies() {
+    local missing_deps=()
+    for cmd in git ssh ssh-keygen; do
+        command -v "$cmd" &>/dev/null || missing_deps+=("$cmd")
+    done
 
-ensure_ssh_directory() {
-    local ssh_dir="$HOME/.ssh"
-
-    if [[ ! -d "$ssh_dir" ]]; then
-        mkdir -p "$ssh_dir"
-        chmod 700 "$ssh_dir"
-        print_info "Created .ssh directory"
+    if (( ${#missing_deps[@]} > 0 )); then
+        log_error "Missing required dependencies: ${missing_deps[*]}"
+        printf '\033[1;33mInstall them with your package manager:\033[0m\n' >&2
+        printf '  macOS: brew install git openssh\n' >&2
+        printf '  Ubuntu/Debian: sudo apt-get install git openssh-client\n' >&2
+        printf '  Arch: sudo pacman -S git openssh\n' >&2
+        exit 1
     fi
 }
 
+# Ensure SSH directory exists with proper permissions
+ensure_ssh_directory() {
+    if [[ -d "$SSH_DIR" ]]; then
+        return 0
+    fi
+
+    mkdir -p -- "$SSH_DIR"
+    chmod 700 -- "$SSH_DIR"
+    log_info "Created .ssh directory"
+}
+
+# Generate SSH key with optional passphrase
 generate_ssh_key() {
     local key_path="$1"
     local email="$2"
     local key_type="$3"
 
     if [[ -f "$key_path" ]]; then
-        print_info "$key_type SSH key already exists at $key_path"
+        log_info "$key_type SSH key already exists at $key_path"
         return 0
     fi
 
-    print_info "Generating $key_type SSH key..."
+    log_info "Generating $key_type SSH key..."
 
-    if ssh-keygen -t ed25519 -C "$email" -f "$key_path" -N "" &>/dev/null; then
-        chmod 600 "$key_path"
-        chmod 644 "${key_path}.pub"
-        print_success "$key_type SSH key generated successfully"
+    # Prompt for passphrase (can be empty by pressing Enter)
+    if ssh-keygen -t ed25519 -C "$email" -f "$key_path"; then
+        chmod 600 -- "$key_path"
+        chmod 644 -- "${key_path}.pub"
+        log_success "$key_type SSH key generated successfully"
         return 0
-    else
-        print_error "Failed to generate $key_type SSH key"
-        return 1
     fi
+
+    log_error "Failed to generate $key_type SSH key"
+    return 1
 }
 
+log_success() { printf '\033[0;32m✓\033[0m %s\n' "$*"; }
+
+# Add key to SSH agent
 add_key_to_agent() {
     local key_path="$1"
     local key_type="$2"
 
-    if ssh-add "$key_path" &>/dev/null; then
-        print_success "$key_type key added to SSH agent"
+    if ssh-add -- "$key_path" 2>/dev/null; then
+        log_success "$key_type key added to SSH agent"
     else
-        print_warning "Could not add $key_type key to SSH agent (may already be added)"
+        log_warn "Could not add $key_type key to SSH agent (may already be added)"
     fi
 }
 
+# Create SSH config file
 create_ssh_config() {
-    local config_content
+    cat > "$SSH_CONFIG" << EOF
+# ============================================================================
+# GitHub SSH Multi-Account Configuration
+# Generated: $(date '+%Y-%m-%d %H:%M:%S')
+# ============================================================================
 
-    config_content="# ============================================================================\n"
-    config_content+="# GitHub SSH Multi-Account Configuration\n"
-    config_content+="# Generated: $(date '+%Y-%m-%d %H:%M:%S')\n"
-    config_content+="# ============================================================================\n\n"
+# Work GitHub account
+Host $WORK_HOST
+    HostName github.com
+    User git
+    IdentityFile $WORK_SSH_KEY
+    IdentitiesOnly yes
+    AddKeysToAgent yes
 
-    config_content+="# Work GitHub account\n"
-    config_content+="Host $WORK_HOST\n"
-    config_content+="    HostName github.com\n"
-    config_content+="    User git\n"
-    config_content+="    IdentityFile $WORK_SSH_KEY\n"
-    config_content+="    IdentitiesOnly yes\n"
-    config_content+="    AddKeysToAgent yes\n\n"
+# Personal GitHub account
+Host $PERSONAL_HOST
+    HostName github.com
+    User git
+    IdentityFile $PERSONAL_SSH_KEY
+    IdentitiesOnly yes
+    AddKeysToAgent yes
 
-    config_content+="# Personal GitHub account\n"
-    config_content+="Host $PERSONAL_HOST\n"
-    config_content+="    HostName github.com\n"
-    config_content+="    User git\n"
-    config_content+="    IdentityFile $PERSONAL_SSH_KEY\n"
-    config_content+="    IdentitiesOnly yes\n"
-    config_content+="    AddKeysToAgent yes\n\n"
+# Default GitHub (personal)
+Host $DEFAULT_HOST
+    HostName github.com
+    User git
+    IdentityFile $PERSONAL_SSH_KEY
+    IdentitiesOnly yes
+    AddKeysToAgent yes
+EOF
 
-    config_content+="# Default GitHub (personal)\n"
-    config_content+="Host github.com\n"
-    config_content+="    HostName github.com\n"
-    config_content+="    User git\n"
-    config_content+="    IdentityFile $PERSONAL_SSH_KEY\n"
-    config_content+="    IdentitiesOnly yes\n"
-    config_content+="    AddKeysToAgent yes"
-
-    echo -e "$config_content" > "$SSH_CONFIG"
-    chmod 600 "$SSH_CONFIG"
-    print_success "SSH config created/updated at $SSH_CONFIG"
+    chmod 600 -- "$SSH_CONFIG"
+    log_success "SSH config created/updated at $SSH_CONFIG"
 }
 
+# Verify SSH key exists
 verify_ssh_key() {
     local key_path="$1"
     local key_type="$2"
 
     if [[ ! -f "$key_path" ]]; then
-        print_error "$key_type SSH key not found: $key_path"
+        log_error "$key_type SSH key not found: $key_path"
         return 1
     fi
 
-    print_success "$key_type SSH key found"
+    log_success "$key_type SSH key found"
     return 0
 }
 
+# Verify SSH config
 verify_ssh_config() {
     if [[ ! -f "$SSH_CONFIG" ]]; then
-        print_warning "SSH config file not found"
+        log_warn "SSH config file not found"
         return 1
     fi
 
-    if ! grep -q "$WORK_HOST" "$SSH_CONFIG" || ! grep -q "$PERSONAL_HOST" "$SSH_CONFIG"; then
-        print_warning "SSH config is incomplete (missing hosts)"
+    if ! grep -q "$WORK_HOST" -- "$SSH_CONFIG" || \
+       ! grep -q "$PERSONAL_HOST" -- "$SSH_CONFIG"; then
+        log_warn "SSH config is incomplete (missing hosts)"
         return 1
     fi
 
-    print_success "SSH config is properly configured"
+    log_success "SSH config is properly configured"
     return 0
 }
 
+# Test SSH connection
 test_ssh_connection() {
     local host="$1"
     local account_name="$2"
+
+    log_info "Testing $account_name SSH connection to $host..."
+
     local output
+    output=$(ssh -T -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "git@$host" 2>&1)
 
-    print_info "Testing $account_name SSH connection to $host..."
-
-    output=$(ssh -T -o ConnectTimeout=10 -o StrictHostKeyChecking=no "git@$host" 2>&1)
-
-    if echo "$output" | grep -q "successfully authenticated"; then
-        print_success "$account_name SSH connection successful"
+    if grep -q "successfully authenticated" <<< "$output"; then
+        log_success "$account_name SSH connection successful"
         return 0
     fi
 
-    print_error "$account_name SSH connection failed"
-    print_info "Add your public key to GitHub: https://github.com/settings/keys"
+    log_error "$account_name SSH connection failed"
+    log_info "Add your public key to GitHub: https://github.com/settings/keys"
     return 1
 }
 
+# Setup SSH keys
 setup_ssh_keys() {
-    load_configuration
+    load_configuration || {
+        log_warn "No configuration found. Running setup first..."
+        interactive_setup
+    }
 
     print_header "SSH Key Setup"
 
     ensure_ssh_directory
 
-    if ! generate_ssh_key "$WORK_SSH_KEY" "$WORK_EMAIL" "Work"; then
-        return 1
+    generate_ssh_key "$WORK_SSH_KEY" "$WORK_EMAIL" "Work" || return 1
+    generate_ssh_key "$PERSONAL_SSH_KEY" "$PERSONAL_EMAIL" "Personal" || return 1
+
+    # Start SSH agent if not running
+    if ! ssh-add -l &>/dev/null; then
+        eval "$(ssh-agent -s)" &>/dev/null
     fi
 
-    if ! generate_ssh_key "$PERSONAL_SSH_KEY" "$PERSONAL_EMAIL" "Personal"; then
-        return 1
-    fi
-
-    eval "$(ssh-agent -s)" &>/dev/null
     add_key_to_agent "$WORK_SSH_KEY" "Work"
     add_key_to_agent "$PERSONAL_SSH_KEY" "Personal"
 
     create_ssh_config
 
     print_header "Next Steps"
-    echo -e "${_YELLOW}${_BOLD}1. Add SSH keys to GitHub:${_NC}"
-    echo ""
-    echo -e "${_CYAN}Work Account:${_NC}"
-    echo "   cat $WORK_SSH_KEY.pub"
-    echo -e "   ${_YELLOW}→ Add to: https://github.com/settings/keys${_NC}"
-    echo ""
-    echo -e "${_CYAN}Personal Account:${_NC}"
-    echo "   cat $PERSONAL_SSH_KEY.pub"
-    echo -e "   ${_YELLOW}→ Add to: https://github.com/settings/keys${_NC}"
-    echo ""
-    echo -e "${_YELLOW}${_BOLD}2. Test your setup:${_NC}"
-    echo "   $SCRIPT_NAME diagnose"
+    printf '\033[1;33m1. Add SSH keys to GitHub:\033[0m\n\n'
+    printf '\033[0;36mWork Account:\033[0m\n'
+    printf '   cat %s.pub\n' "$WORK_SSH_KEY"
+    printf '   \033[1;33m→ Add to: https://github.com/settings/keys\033[0m\n\n'
+    printf '\033[0;36mPersonal Account:\033[0m\n'
+    printf '   cat %s.pub\n' "$PERSONAL_SSH_KEY"
+    printf '   \033[1;33m→ Add to: https://github.com/settings/keys\033[0m\n\n'
+    printf '\033[1;33m2. Test your setup:\033[0m\n'
+    printf '   %s diagnose\n' "$SCRIPT_NAME"
 }
 
-# =============================================================================
-# GIT CONFIGURATION
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Git Configuration
+# -----------------------------------------------------------------------------
 configure_git_account() {
     local account_type="$1"
-
     load_configuration
 
-    if [[ "$account_type" == "work" ]]; then
-        git config user.name "$WORK_NAME"
-        git config user.email "$WORK_EMAIL"
-        git config core.sshCommand "ssh -i $WORK_SSH_KEY -o IdentitiesOnly=yes"
-        print_success "Work account configured"
-        echo ""
-        echo -e "  ${_BOLD}User:${_NC}   ${_PURPLE}$WORK_NAME${_NC}"
-        echo -e "  ${_BOLD}Email:${_NC}  ${_PURPLE}$WORK_EMAIL${_NC}"
-        echo -e "  ${_BOLD}Host:${_NC}   ${_PURPLE}$WORK_HOST${_NC}"
-    else
-        git config user.name "$PERSONAL_NAME"
-        git config user.email "$PERSONAL_EMAIL"
-        git config core.sshCommand "ssh -i $PERSONAL_SSH_KEY -o IdentitiesOnly=yes"
-        print_success "Personal account configured"
-        echo ""
-        echo -e "  ${_BOLD}User:${_NC}   ${_PURPLE}$PERSONAL_NAME${_NC}"
-        echo -e "  ${_BOLD}Email:${_NC}  ${_PURPLE}$PERSONAL_EMAIL${_NC}"
-        echo -e "  ${_BOLD}Host:${_NC}   ${_PURPLE}$PERSONAL_HOST${_NC}"
-    fi
+    local name email ssh_key host
+    case "$account_type" in
+        work)
+            name="$WORK_NAME"
+            email="$WORK_EMAIL"
+            ssh_key="$WORK_SSH_KEY"
+            host="$WORK_HOST"
+            ;;
+        personal)
+            name="$PERSONAL_NAME"
+            email="$PERSONAL_EMAIL"
+            ssh_key="$PERSONAL_SSH_KEY"
+            host="$PERSONAL_HOST"
+            ;;
+        *)
+            log_error "Invalid account type: $account_type"
+            return 1
+            ;;
+    esac
+
+    git config user.name -- "$name"
+    git config user.email -- "$email"
+    git config core.sshCommand -- "ssh -i $ssh_key -o IdentitiesOnly=yes"
+
+    log_success "${ACCOUNT_INFO[$account_type]} account configured"
+    printf '\n  \033[1mUser:\033[0m   \033[0;35m%s\033[0m\n' "$name"
+    printf '  \033[1mEmail:\033[0m  \033[0;35m%s\033[0m\n' "$email"
+    printf '  \033[1mHost:\033[0m   \033[0;35m%s\033[0m\n' "$host"
 }
 
+# Get current remote URL
 get_current_remote_url() {
-    git remote get-url origin 2>/dev/null
+    git remote get-url origin 2>/dev/null || true
 }
 
+# Get SSH command
 get_ssh_command() {
     git config core.sshCommand 2>/dev/null || echo "default"
 }
 
+# Show current configuration
 show_current_configuration() {
     print_header "Current Git Configuration"
 
     local user_name user_email remote_url ssh_cmd
-
     user_name=$(git config user.name 2>/dev/null || echo "Not set")
     user_email=$(git config user.email 2>/dev/null || echo "Not set")
     remote_url=$(get_current_remote_url)
     ssh_cmd=$(get_ssh_command)
 
     print_section "User"
-    echo -e "  Name:  ${_CYAN}$user_name${_NC}"
-    echo -e "  Email: ${_CYAN}$user_email${_NC}"
+    printf '  Name:  \033[0;36m%s\033[0m\n' "$user_name"
+    printf '  Email: \033[0;36m%s\033[0m\n' "$user_email"
 
     if [[ -n "$remote_url" ]]; then
         print_section "Remote"
-        echo -e "  URL: ${_CYAN}$remote_url${_NC}"
+        printf '  URL: \033[0;36m%s\033[0m\n' "$remote_url"
     fi
 
     print_section "SSH"
-    echo -e "  Command: ${_CYAN}$ssh_cmd${_NC}"
+    printf '  Command: \033[0;36m%s\033[0m\n' "$ssh_cmd"
 }
 
-# =============================================================================
-# CONTEXT DETECTION
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Context Detection
+# -----------------------------------------------------------------------------
 detect_context() {
     local current_dir
     current_dir="$(pwd)"
 
     load_configuration
 
-    if [[ "$current_dir" == "$WORK_FOLDER"* ]]; then
+    if [[ -n "$WORK_FOLDER" && "$current_dir" == "$WORK_FOLDER"* ]]; then
         echo "work"
     else
         echo "personal"
     fi
 }
 
+# Select account type interactively
 select_account_type() {
     print_header "Select Account Type"
-    echo -e "${_YELLOW}Current directory:${_NC} ${_CYAN}$(pwd)${_NC}"
-    echo ""
+    printf '\033[1;33mCurrent directory:\033[0m \033[0;36m%s\033[0m\n' "$(pwd)"
+    printf '\n'
 
     local remote_url
     remote_url=$(get_current_remote_url)
     if [[ -n "$remote_url" ]]; then
-        echo -e "${_YELLOW}Remote URL:${_NC} ${_CYAN}$remote_url${_NC}"
-        echo ""
+        printf '\033[1;33mRemote URL:\033[0m \033[0;36m%s\033[0m\n' "$remote_url"
+        printf '\n'
     fi
 
-    echo -e "${_GREEN}┌─────────────────────────────────────────────────────┐${_NC}"
-    echo -e "${_GREEN}│  ${_BOLD}[1] WORK${_NC}${_GREEN} - Company/Organization repository     │${_NC}"
-    echo -e "${_GREEN}│       $WORK_EMAIL${_NC}"
-    echo -e "${_GREEN}└─────────────────────────────────────────────────────┘${_NC}"
-    echo ""
-    echo -e "${_BLUE}┌─────────────────────────────────────────────────────┐${_NC}"
-    echo -e "${_BLUE}│  ${_BOLD}[2] PERSONAL${_NC}${_BLUE} - Your personal repository          │${_NC}"
-    echo -e "${_BLUE}│       $PERSONAL_EMAIL${_NC}"
-    echo -e "${_BLUE}└─────────────────────────────────────────────────────┘${_NC}"
-    echo ""
+    printf '\033[0;32m┌─────────────────────────────────────────────────────┐\033[0m\n'
+    printf '\033[0;32m│  \033[1m[1] WORK\033[0m\033[0;32m - Company/Organization repository     │\033[0m\n'
+    printf '\033[0;32m│       %s\033[0m\n' "$WORK_EMAIL"
+    printf '\033[0;32m└─────────────────────────────────────────────────────┘\033[0m\n'
+    printf '\n'
+    printf '\033[0;34m┌─────────────────────────────────────────────────────┐\033[0m\n'
+    printf '\033[0;34m│  \033[1m[2] PERSONAL\033[0m\033[0;34m - Your personal repository          │\033[0m\n'
+    printf '\033[0;34m│       %s\033[0m\n' "$PERSONAL_EMAIL"
+    printf '\033[0;34m└─────────────────────────────────────────────────────┘\033[0m\n'
+    printf '\n'
 
     local choice
     while true; do
-        read -p "$(echo -e "${_YELLOW}${_BOLD}Enter your choice [1/2]: ${_NC}")" choice
-
+        read -rp "$(printf '\033[1;33m\033[1mEnter your choice [1/2]: \033[0m')" choice
         case "$choice" in
-            1)
-                echo "work"
-                return 0
-                ;;
-            2)
-                echo "personal"
-                return 0
-                ;;
-            *)
-                print_error "Invalid choice. Please enter 1 or 2."
-                echo ""
-                ;;
+            1) echo "work"; return 0 ;;
+            2) echo "personal"; return 0 ;;
+            *) log_error "Invalid choice. Please enter 1 or 2."; printf '\n' ;;
         esac
     done
 }
 
-# =============================================================================
-# REMOTE URL MANAGEMENT
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Remote URL Management
+# -----------------------------------------------------------------------------
 update_remote_url() {
     local account_type="$1"
     local current_url
-
     current_url=$(get_current_remote_url)
 
-    if [[ -z "$current_url" ]]; then
-        print_warning "No origin remote found"
-        return 1
-    fi
+    [[ -z "$current_url" ]] && { log_warn "No origin remote found"; return 1; }
 
-    local new_url
+    local target_host
     if [[ "$account_type" == "work" ]]; then
-        new_url=$(echo "$current_url" | sed -e "s/@github\.com:/@$WORK_HOST:/g" -e "s/@$PERSONAL_HOST:/@$WORK_HOST:/g")
+        target_host="$WORK_HOST"
     else
-        new_url=$(echo "$current_url" | sed -e "s/@github\.com:/@$PERSONAL_HOST:/g" -e "s/@$WORK_HOST:/@$PERSONAL_HOST:/g")
+        target_host="$PERSONAL_HOST"
     fi
 
-    git remote set-url origin "$new_url"
-    print_success "Remote URL updated"
+    # Replace host in URL using parameter expansion
+    local new_url="$current_url"
+    new_url="${new_url//@github.com:/@}"
+    new_url${target_host}:="${new_url//@${WORK_HOST}:/@${target_host}:}"
+    new_url="${new_url//@${PERSONAL_HOST}:/@${target_host}:}"
+
+    git remote set-url origin -- "$new_url"
+    log_success "Remote URL updated"
 }
 
+# Fix remote URL
 fix_remote_url() {
     local current_url
-
     current_url=$(get_current_remote_url)
 
-    if [[ -z "$current_url" ]]; then
-        print_error "No origin remote found"
-        print_info "Add a remote first: git remote add origin <url>"
+    [[ -z "$current_url" ]] && {
+        log_error "No origin remote found"
+        log_info "Add a remote first: git remote add origin <url>"
         return 1
-    fi
+    }
 
     print_header "Remote URL Configuration"
-    echo -e "  Current: ${_CYAN}$current_url${_NC}"
-    echo ""
+    printf '  Current: \033[0;36m%s\033[0m\n' "$current_url"
+    printf '\n'
 
     local current_type=""
-    if [[ "$current_url" == *"@$WORK_HOST:"* ]]; then
+    if [[ "$current_url" == *"@${WORK_HOST}:"* ]]; then
         current_type="work"
-        echo -e "  Status: ${_GREEN}Configured for WORK${_NC}"
-    elif [[ "$current_url" == *"@$PERSONAL_HOST:"* ]]; then
+        printf '  Status: \033[0;32mConfigured for WORK\033[0m\n'
+    elif [[ "$current_url" == *"@${PERSONAL_HOST}:"* ]]; then
         current_type="personal"
-        echo -e "  Status: ${_GREEN}Configured for PERSONAL${_NC}"
+        printf '  Status: \033[0;32mConfigured for PERSONAL\033[0m\n'
     elif [[ "$current_url" == *"@github.com:"* ]]; then
-        echo -e "  Status: ${_YELLOW}Using plain github.com (needs configuration)${_NC}"
+        printf '  Status: \033[1;33mUsing plain github.com (needs configuration)\033[0m\n'
     else
-        print_success "Remote URL is properly configured"
+        log_success "Remote URL is properly configured"
         return 0
     fi
 
-    echo ""
-
+    printf '\n'
     if [[ -n "$current_type" ]]; then
-        if ! confirm_continue "Change the account type?"; then
-            print_info "Configuration unchanged"
+        confirm_continue "Change the account type?" || {
+            log_info "Configuration unchanged"
             return 0
-        fi
+        }
     fi
 
     local account_type
@@ -526,166 +588,144 @@ fix_remote_url() {
 
     print_header "Applying Configuration"
 
-    if [[ "$account_type" == "work" ]]; then
-        update_remote_url "work"
-        configure_git_account "work"
-    else
-        update_remote_url "personal"
-        configure_git_account "personal"
-    fi
+    case "$account_type" in
+        work)
+            update_remote_url "work"
+            configure_git_account "work"
+            ;;
+        personal)
+            update_remote_url "personal"
+            configure_git_account "personal"
+            ;;
+    esac
 }
 
-# =============================================================================
-# REPOSITORY OPERATIONS
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Repository Operations
+# -----------------------------------------------------------------------------
 setup_repository() {
     local repo_url="$1"
-
-    if [[ -z "$repo_url" ]]; then
-        print_error "Repository URL is required"
-        print_info "Usage: $SCRIPT_NAME setup <repository-url>"
+    [[ -z "$repo_url" ]] && {
+        log_error "Repository URL is required"
+        log_info "Usage: $SCRIPT_NAME setup <repository-url>"
         return 1
-    fi
+    }
 
     load_configuration
-
     local context
     context=$(detect_context)
 
-    # Convert HTTPS to SSH
-    repo_url=$(echo "$repo_url" | sed 's|https://github.com/|git@github.com:|g')
+    # Convert HTTPS to SSH using parameter expansion
+    repo_url="${repo_url//https:\/\/github.com\//git@github.com:}"
 
     # Apply correct host
     if [[ "$context" == "work" ]]; then
-        repo_url=$(echo "$repo_url" | sed "s/github\.com/$WORK_HOST/g")
+        repo_url="${repo_url//github\.com/${WORK_HOST}}"
     else
-        repo_url=$(echo "$repo_url" | sed "s/github\.com/$PERSONAL_HOST/g")
+        repo_url="${repo_url//github\.com/${PERSONAL_HOST}}"
     fi
 
-    print_info "Cloning repository with ${context^^} configuration..."
-    echo -e "  URL: ${_CYAN}$repo_url${_NC}"
-    echo ""
+    log_info "Cloning repository with ${context^^} configuration..."
+    printf '  URL: \033[0;36m%s\033[0m\n' "$repo_url"
+    printf '\n'
 
-    if git clone "$repo_url"; then
+    if git clone -- "$repo_url"; then
         local repo_name
-        repo_name=$(basename "$repo_url" .git)
+        repo_name="${repo_url##*/}"
+        repo_name="${repo_name%.git}"
 
         if [[ -d "$repo_name" ]]; then
-            cd "$repo_name"
+            cd -- "$repo_name"
             configure_git_account "$context"
-            print_success "Repository cloned and configured"
-            echo -e "  Location: ${_CYAN}$(pwd)${_NC}"
-            cd - &>/dev/null
+            log_success "Repository cloned and configured"
+            printf '  Location: \033[0;36m%s\033[0m\n' "$(pwd)"
+            cd -- "${OLDPWD:-.}" &>/dev/null || true
         fi
     else
-        print_error "Failed to clone repository"
+        log_error "Failed to clone repository"
         return 1
     fi
 }
 
-# =============================================================================
-# INTERACTIVE SETUP
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Interactive Setup
+# -----------------------------------------------------------------------------
 interactive_setup() {
     print_header "Interactive Configuration"
 
-    # Work folder
     print_section "Work Folder"
-    echo -e "  Current: ${_CYAN}$WORK_FOLDER${_NC}"
-    echo ""
+    printf '  Current: \033[0;36m%s\033[0m\n' "${WORK_FOLDER:-<not set>}"
+    printf '\n'
 
     local new_work_folder
-    read -p "Enter work folder path (or press Enter to keep current): " new_work_folder
-
+    read -rp "Enter work folder path (or press Enter to keep current): " new_work_folder
     if [[ -n "$new_work_folder" ]]; then
         new_work_folder=$(expand_path "$new_work_folder")
         if [[ -e "$new_work_folder" ]]; then
             WORK_FOLDER="$new_work_folder"
-            print_success "Work folder updated: $WORK_FOLDER"
+            log_success "Work folder updated: $WORK_FOLDER"
         else
-            print_error "Path does not exist: $new_work_folder"
+            log_error "Path does not exist: $new_work_folder"
         fi
     fi
-    echo ""
+    printf '\n'
 
-    # Work account
     print_section "Work Account"
-
-    local new_work_name
-    while true; do
-        read -p "Enter your work name: " new_work_name
-        if [[ -n "$new_work_name" ]]; then
-            WORK_NAME="$new_work_name"
-            break
-        fi
-        print_error "Name cannot be empty"
+    while :; do
+        read -rp "Enter your work name: " WORK_NAME
+        [[ -n "$WORK_NAME" ]] && break
+        log_error "Name cannot be empty"
     done
 
-    while true; do
-        read -p "Enter your work email: " new_work_email
-        if [[ -n "$new_work_email" ]] && is_valid_email "$new_work_email"; then
-            WORK_EMAIL="$new_work_email"
-            break
-        fi
-        print_error "Invalid email format"
+    while :; do
+        read -rp "Enter your work email: " WORK_EMAIL
+        [[ -n "$WORK_EMAIL" ]] && is_valid_email "$WORK_EMAIL" && break
+        log_error "Invalid email format"
     done
-    echo ""
+    printf '\n'
 
-    # Personal account
     print_section "Personal Account"
-
-    local new_personal_name
-    while true; do
-        read -p "Enter your personal name: " new_personal_name
-        if [[ -n "$new_personal_name" ]]; then
-            PERSONAL_NAME="$new_personal_name"
-            break
-        fi
-        print_error "Name cannot be empty"
+    while :; do
+        read -rp "Enter your personal name: " PERSONAL_NAME
+        [[ -n "$PERSONAL_NAME" ]] && break
+        log_error "Name cannot be empty"
     done
 
-    while true; do
-        read -p "Enter your personal email: " new_personal_email
-        if [[ -n "$new_personal_email" ]] && is_valid_email "$new_personal_email"; then
-            PERSONAL_EMAIL="$new_personal_email"
-            break
-        fi
-        print_error "Invalid email format"
+    while :; do
+        read -rp "Enter your personal email: " PERSONAL_EMAIL
+        [[ -n "$PERSONAL_EMAIL" ]] && is_valid_email "$PERSONAL_EMAIL" && break
+        log_error "Invalid email format"
     done
 
-    # Summary
     print_header "Configuration Summary"
-    echo -e "  ${_BOLD}Work:${_NC}"
-    echo -e "    Folder: ${_CYAN}$WORK_FOLDER${_NC}"
-    echo -e "    Name:   ${_CYAN}$WORK_NAME${_NC}"
-    echo -e "    Email:  ${_CYAN}$WORK_EMAIL${_NC}"
-    echo ""
-    echo -e "  ${_BOLD}Personal:${_NC}"
-    echo -e "    Name:   ${_CYAN}$PERSONAL_NAME${_NC}"
-    echo -e "    Email:  ${_CYAN}$PERSONAL_EMAIL${_NC}"
-    echo ""
+    printf '  \033[1mWork:\033[0m\n'
+    printf '    Folder: \033[0;36m%s\033[0m\n' "${WORK_FOLDER:-<not set>}"
+    printf '    Name:   \033[0;36m%s\033[0m\n' "$WORK_NAME"
+    printf '    Email:  \033[0;36m%s\033[0m\n' "$WORK_EMAIL"
+    printf '\n'
+    printf '  \033[1mPersonal:\033[0m\n'
+    printf '    Name:   \033[0;36m%s\033[0m\n' "$PERSONAL_NAME"
+    printf '    Email:  \033[0;36m%s\033[0m\n' "$PERSONAL_EMAIL"
+    printf '\n'
 
     if confirm_yes_no "Save this configuration?" "yes"; then
         save_configuration
-        print_success "Configuration complete!"
-        print_info "Next step: Run '$SCRIPT_NAME init'"
+        log_success "Configuration complete!"
+        log_info "Next step: Run '$SCRIPT_NAME init'"
     else
-        print_warning "Configuration not saved"
+        log_warn "Configuration not saved"
     fi
 }
 
-# =============================================================================
-# AUTO CONFIGURATION
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Auto Configuration
+# -----------------------------------------------------------------------------
 auto_configure() {
-    if ! is_git_repository; then
-        print_error "Not a git repository"
-        print_info "Run this command inside a git repository or use 'setup' to clone"
+    is_git_repository || {
+        log_error "Not a git repository"
+        log_info "Run this command inside a git repository or use 'setup' to clone"
         return 1
-    fi
+    }
 
     load_configuration
 
@@ -693,163 +733,177 @@ auto_configure() {
     context=$(detect_context)
 
     print_header "Auto-Configuration"
-    echo -e "  Context detected: ${_YELLOW}${context^^}${_NC}"
-    echo -e "  Directory: ${_CYAN}$(pwd)${_NC}"
-    echo ""
+    printf '  Context detected: \033[1;33m%s\033[0m\n' "${context^^}"
+    printf '  Directory: \033[0;36m%s\033[0m\n' "$(pwd)"
+    printf '\n'
 
     configure_git_account "$context"
-    print_success "Configuration complete!"
+    log_success "Configuration complete!"
 }
 
-# =============================================================================
-# DIAGNOSTICS
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Diagnostics
+# -----------------------------------------------------------------------------
 run_diagnostics() {
     load_configuration
 
     print_banner
     print_header "System Diagnostics"
 
-    # Configuration
     print_section "Configuration"
-    echo -e "  Work Folder:    ${_YELLOW}$WORK_FOLDER${_NC}"
-    echo -e "  Work Name:      ${_YELLOW}$WORK_NAME${_NC}"
-    echo -e "  Work Email:     ${_YELLOW}$WORK_EMAIL${_NC}"
-    echo -e "  Personal Name:  ${_YELLOW}$PERSONAL_NAME${_NC}"
-    echo -e "  Personal Email: ${_YELLOW}$PERSONAL_EMAIL${_NC}"
-    echo ""
+    printf '  Work Folder:    \033[1;33m%s\033[0m\n' "${WORK_FOLDER:-<not set>}"
+    printf '  Work Name:      \033[1;33m%s\033[0m\n' "${WORK_NAME:-<not set>}"
+    printf '  Work Email:     \033[1;33m%s\033[0m\n' "${WORK_EMAIL:-<not set>}"
+    printf '  Personal Name:  \033[1;33m%s\033[0m\n' "${PERSONAL_NAME:-<not set>}"
+    printf '  Personal Email: \033[1;33m%s\033[0m\n' "${PERSONAL_EMAIL:-<not set>}"
+    printf '\n'
 
-    # SSH Keys
     print_section "SSH Keys"
     verify_ssh_key "$WORK_SSH_KEY" "Work"
     verify_ssh_key "$PERSONAL_SSH_KEY" "Personal"
-    echo ""
+    printf '\n'
 
-    # SSH Config
     print_section "SSH Configuration"
     verify_ssh_config
-    echo ""
+    printf '\n'
 
-    # Connections
     print_section "GitHub Connections"
     test_ssh_connection "$WORK_HOST" "Work"
     test_ssh_connection "$PERSONAL_HOST" "Personal"
-    echo ""
+    printf '\n'
 
-    # Context
+    print_section "Current Context"
     local context
     context=$(detect_context)
-    print_section "Current Context"
-    echo -e "  Detected:  ${_YELLOW}${context^^}${_NC}"
-    echo -e "  Directory: ${_YELLOW}$(pwd)${_NC}"
+    printf '  Detected:  \033[1;33m%s\033[0m\n' "${context^^}"
+    printf '  Directory: \033[1;33m%s\033[0m\n' "$(pwd)"
 
     if is_git_repository; then
-        echo ""
+        printf '\n'
         show_current_configuration
     fi
 }
 
-# =============================================================================
-# HELP AND VERSION
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Help & Version
+# -----------------------------------------------------------------------------
 show_version() {
     print_banner
-    echo -e "${_BOLD}Git SSH Multi-Account Manager${_NC}"
-    echo -e "Version: ${_YELLOW}$VERSION${_NC}"
-    echo ""
+    printf '\033[1mGit SSH Multi-Account Manager\033[0m\n'
+    printf 'Version: \033[1;33m%s\033[0m\n' "$SCRIPT_VERSION"
+    printf '\n'
 }
 
 show_help() {
     print_banner
 
-    echo -e "${_YELLOW}${_BOLD}USAGE${_NC}"
-    echo "  $SCRIPT_NAME [OPTIONS] <COMMAND> [ARGUMENTS]"
-    echo "  $SCRIPT_NAME --path <PATH> <COMMAND>"
-    echo ""
+    printf '\033[1;33mUSAGE\033[0m\n'
+    printf '  %s [OPTIONS] <COMMAND> [ARGUMENTS]\n' "$SCRIPT_NAME"
+    printf '  %s --path <PATH> <COMMAND>\n' "$SCRIPT_NAME"
+    printf '\n'
 
-    echo -e "${_YELLOW}${_BOLD}OPTIONS${_NC}"
-    echo "  --path <PATH>    Override work folder path"
-    echo "  --help, -h       Show this help message"
-    echo "  --version, -v    Show version information"
-    echo ""
+    printf '\033[1;33mOPTIONS\033[0m\n'
+    printf '  --path <PATH>    Override work folder path\n'
+    printf '  --trace, -x      Enable trace mode for debugging\n'
+    printf '  --help, -h       Show this help message\n'
+    printf '  --version, -v    Show version information\n'
+    printf '\n'
 
-    echo -e "${_YELLOW}${_BOLD}COMMANDS${_NC}"
-    echo "  setup-config     Interactive configuration wizard"
-    echo "  init             Initialize SSH keys and configuration"
-    echo "  work             Configure for work account"
-    echo "  personal         Configure for personal account"
-    echo "  fix-remote       Fix/change remote URL"
-    echo "  setup <URL>      Clone repository with auto-configuration"
-    echo "  status           Show current git configuration"
-    echo "  diagnose         Run comprehensive diagnostics"
-    echo "  auto             Auto-detect and configure based on path"
-    echo "  help             Show this help message"
-    echo ""
+    printf '\033[1;33mCOMMANDS\033[0m\n'
+    printf '  setup-config     Interactive configuration wizard\n'
+    printf '  init             Initialize SSH keys and configuration\n'
+    printf '  work             Configure for work account\n'
+    printf '  personal         Configure for personal account\n'
+    printf '  fix-remote       Fix/change remote URL\n'
+    printf '  setup <URL>      Clone repository with auto-configuration\n'
+    printf '  status           Show current git configuration\n'
+    printf '  diagnose         Run comprehensive diagnostics\n'
+    printf '  auto             Auto-detect and configure based on path\n'
+    printf '  help             Show this help message\n'
+    printf '\n'
 
-    echo -e "${_YELLOW}${_BOLD}EXAMPLES${_NC}"
-    echo "  # First-time setup"
-    echo "  $SCRIPT_NAME setup-config"
-    echo "  $SCRIPT_NAME init"
-    echo ""
-    echo "  # Auto-configure based on location"
-    echo "  cd ~/projects/work && $SCRIPT_NAME auto"
-    echo ""
-    echo "  # Override work folder"
-    echo "  $SCRIPT_NAME --path /custom/path auto"
-    echo ""
-    echo "  # Clone with auto-configuration"
-    echo "  $SCRIPT_NAME setup git@github.com:user/repo.git"
-    echo ""
-    echo "  # Fix remote URL"
-    echo "  $SCRIPT_NAME fix-remote"
-    echo ""
-    echo "  # Check everything"
-    echo "  $SCRIPT_NAME diagnose"
-    echo ""
+    printf '\033[1;33mEXAMPLES\033[0m\n'
+    printf '  # First-time setup\n'
+    printf '  %s setup-config\n' "$SCRIPT_NAME"
+    printf '  %s init\n'
+    printf '\n'
+    printf '  # Auto-configure based on location\n'
+    printf '  cd ~/projects/work && %s auto\n' "$SCRIPT_NAME"
+    printf '\n'
+    printf '  # Override work folder\n'
+    printf '  %s --path /custom/path auto\n' "$SCRIPT_NAME"
+    printf '\n'
+    printf '  # Clone with auto-configuration\n'
+    printf '  %s setup git@github.com:user/repo.git\n' "$SCRIPT_NAME"
+    printf '\n'
+    printf '  # Fix remote URL\n'
+    printf '  %s fix-remote\n' "$SCRIPT_NAME"
+    printf '\n'
+    printf '  # Check everything\n'
+    printf '  %s diagnose\n' "$SCRIPT_NAME"
+    printf '\n'
 
-    echo -e "${_YELLOW}${_BOLD}FILES${_NC}"
-    echo "  Configuration: $CONFIG_FILE"
-    echo "  SSH Config:    $SSH_CONFIG"
-    echo "  Work Key:      $WORK_SSH_KEY"
-    echo "  Personal Key:  $PERSONAL_SSH_KEY"
-    echo ""
+    printf '\033[1;33mFILES\033[0m\n'
+    printf '  Configuration: %s\n' "$CONFIG_FILE"
+    printf '  SSH Config:    %s\n' "$SSH_CONFIG"
+    printf '  Work Key:      %s\n' "$WORK_SSH_KEY"
+    printf '  Personal Key:  %s\n' "$PERSONAL_SSH_KEY"
+    printf '\n'
 
-    echo -e "${_YELLOW}${_BOLD}RESOURCES${_NC}"
-    echo "  GitHub SSH Guide: https://docs.github.com/en/authentication/connecting-to-github-with-ssh"
-    echo ""
+    printf '\033[1;33mENVIRONMENT\033[0m\n'
+    printf '  WORK_FOLDER    Override work folder path (permanent)\n'
+    printf '  LOG_LEVEL      Set log level: DEBUG, INFO, WARN, ERROR\n'
+    printf '\n'
+
+    printf '\033[1;33mRESOURCES\033[0m\n'
+    printf '  GitHub SSH Guide: https://docs.github.com/en/authentication/connecting-to-github-with-ssh\n'
+    printf '\n'
 }
 
-# =============================================================================
-# COMMAND PARSING
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Argument Parsing
+# -----------------------------------------------------------------------------
+usage() {
+    show_help
+    exit "${1:-0}"
+}
 
 parse_arguments() {
-    while [[ $# -gt 0 ]]; do
+    while (( $# > 0 )); do
         case "$1" in
             --path)
                 if [[ -n "${2:-}" && ! "$2" =~ ^- ]]; then
                     local expanded_path
                     expanded_path=$(expand_path "$2")
                     if [[ ! -e "$expanded_path" ]]; then
-                        print_error "Path does not exist: $expanded_path"
+                        log_error "Path does not exist: $expanded_path"
                         exit 1
                     fi
-                    OVERRIDE_WORK_FOLDER="$expanded_path"
+                    WORK_FOLDER="$expanded_path"
                     shift 2
                 else
-                    print_error "--path requires a valid path argument"
+                    log_error "--path requires a valid path argument"
                     exit 1
                 fi
                 ;;
+            --trace|-x)
+                TRACE_MODE="true"
+                shift
+                ;;
             --help|-h)
-                show_help
-                exit 0
+                usage 0
                 ;;
             --version|-v)
                 show_version
                 exit 0
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage 1
                 ;;
             *)
                 break
@@ -858,20 +912,20 @@ parse_arguments() {
     done
 }
 
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# Main Entry Point
+# -----------------------------------------------------------------------------
 main() {
     local command="${1:-auto}"
+    shift 2>/dev/null || true
+
+    # Enable trace mode if requested
+    if [[ "$TRACE_MODE" == "true" ]]; then
+        set -x
+    fi
 
     # Check dependencies first
     check_dependencies
-
-    # Apply path override if provided
-    if [[ -n "$OVERRIDE_WORK_FOLDER" ]]; then
-        WORK_FOLDER="$OVERRIDE_WORK_FOLDER"
-    fi
 
     case "$command" in
         setup-config|config)
@@ -881,53 +935,40 @@ main() {
         init|initialize)
             print_banner
             if ! load_configuration; then
-                print_warning "No configuration found"
-                print_info "Running setup first..."
-                echo ""
+                log_warn "No configuration found"
+                log_info "Running setup first..."
+                printf '\n'
                 interactive_setup
-                echo ""
+                printf '\n'
             fi
             setup_ssh_keys
             ;;
         work)
-            if ! is_git_repository; then
-                print_error "Not a git repository"
-                exit 1
-            fi
+            is_git_repository || { log_error "Not a git repository"; exit 1; }
             print_banner
             configure_git_account "work"
             ;;
         personal)
-            if ! is_git_repository; then
-                print_error "Not a git repository"
-                exit 1
-            fi
+            is_git_repository || { log_error "Not a git repository"; exit 1; }
             print_banner
             configure_git_account "personal"
             ;;
         fix-remote|fix)
-            if ! is_git_repository; then
-                print_error "Not a git repository"
-                exit 1
-            fi
+            is_git_repository || { log_error "Not a git repository"; exit 1; }
             print_banner
             fix_remote_url
             ;;
         setup|clone)
-            local repo_url="$2"
-            if [[ -z "$repo_url" ]]; then
-                print_error "Repository URL is required"
-                print_info "Usage: $SCRIPT_NAME setup <repository-url>"
+            local repo_url="$1"
+            [[ -z "$repo_url" ]] && {
+                log_error "Repository URL is required"
                 exit 1
-            fi
+            }
             print_banner
             setup_repository "$repo_url"
             ;;
         status|show)
-            if ! is_git_repository; then
-                print_error "Not a git repository"
-                exit 1
-            fi
+            is_git_repository || { log_error "Not a git repository"; exit 1; }
             print_banner
             show_current_configuration
             ;;
@@ -938,26 +979,28 @@ main() {
             show_help
             ;;
         auto|"")
-            if ! is_git_repository; then
+            is_git_repository || {
                 print_banner
-                print_error "Not a git repository"
-                echo ""
+                log_error "Not a git repository"
+                printf '\n'
                 show_help
                 exit 1
-            fi
+            }
             print_banner
             auto_configure
             ;;
         *)
             print_banner
-            print_error "Unknown command: $command"
-            echo ""
+            log_error "Unknown command: $command"
+            printf '\n'
             show_help
             exit 1
             ;;
     esac
 }
 
-# Entry point
+# -----------------------------------------------------------------------------
+# Entry Point
+# -----------------------------------------------------------------------------
 parse_arguments "$@"
 main "$@"
